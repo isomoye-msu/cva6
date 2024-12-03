@@ -169,7 +169,8 @@ module csr_regfile
     // TO_BE_COMPLETED - PERF_COUNTERS
     output logic [31:0] mcountinhibit_o,
     // RVFI
-    output rvfi_probes_csr_t rvfi_csr_o
+    output rvfi_probes_csr_t rvfi_csr_o,
+    output logic             c3_enable_o
 );
 
   localparam logic [63:0] SMODE_STATUS_READ_MASK = ariane_pkg::smode_status_read_mask(CVA6Cfg);
@@ -227,7 +228,7 @@ module csr_regfile
   // we are in debug
   logic debug_mode_q, debug_mode_d;
   logic mtvec_rst_load_q;  // used to determine whether we came out of reset
-
+z
   logic [CVA6Cfg.XLEN-1:0] dpc_q, dpc_d;
   logic [CVA6Cfg.XLEN-1:0] dscratch0_q, dscratch0_d;
   logic [CVA6Cfg.XLEN-1:0] dscratch1_q, dscratch1_d;
@@ -277,6 +278,10 @@ module csr_regfile
   riscv::pmpcfg_t [63:0] pmpcfg_q, pmpcfg_d, pmpcfg_next;
   logic [63:0][CVA6Cfg.PLEN-3:0] pmpaddr_q, pmpaddr_d, pmpaddr_next;
   logic [MHPMCounterNum+3-1:0] mcountinhibit_d, mcountinhibit_q;
+
+
+  //c3 enable signals
+  logic c3_enable_d, c3_enable_q;
 
   localparam logic [CVA6Cfg.XLEN-1:0] IsaCode = (CVA6Cfg.XLEN'(CVA6Cfg.RVA) <<  0)                // A - Atomic Instructions extension
   | (CVA6Cfg.XLEN'(CVA6Cfg.RVB) << 1)  // B - Bitmanip extension
@@ -860,6 +865,9 @@ module csr_regfile
             csr_rdata = pmpaddr_q[index][CVA6Cfg.PLEN-3:0];
           else csr_rdata = {pmpaddr_q[index][CVA6Cfg.PLEN-3:1], 1'b0};
         end
+        riscv::CSR_C3_ENABLE_0: begin
+          csr_rdata = c3_enable_q;
+        end
         default: read_access_exception = 1'b1;
       endcase
     end
@@ -918,6 +926,7 @@ module csr_regfile
     priv_lvl_d                      = priv_lvl_q;
     v_d                             = v_q;
     debug_mode_d                    = debug_mode_q;
+    c3_enable_d                     = c3_enable_q;
 
     if (CVA6Cfg.DebugEn) begin
       dcsr_d      = dcsr_q;
@@ -1715,6 +1724,9 @@ module csr_regfile
           if (!pmpcfg_q[index].locked && !(pmpcfg_q[index+1].locked && pmpcfg_q[index+1].addr_mode == riscv::TOR)) begin
             pmpaddr_d[index] = csr_wdata[CVA6Cfg.PLEN-3:0];
           end
+        end
+        riscv::CSR_C3_ENABLE_0: begin
+          c3_enable_d = csr_wdata;
         end
         default: update_access_exception = 1'b1;
       endcase
@@ -2518,6 +2530,7 @@ module csr_regfile
   assign single_step_o = CVA6Cfg.DebugEn ? dcsr_q.step : 1'b0;
   assign mcountinhibit_o = {{29 - MHPMCounterNum{1'b0}}, mcountinhibit_q};
 
+  assign c3_enable_o = c3_enable_q;
   // sequential process
   always_ff @(posedge clk_i or negedge rst_ni) begin
     if (~rst_ni) begin
@@ -2526,6 +2539,7 @@ module csr_regfile
       fcsr_q       <= '0;
       // debug signals
       debug_mode_q <= 1'b0;
+      c3_enable_q <= '0;
       if (CVA6Cfg.DebugEn) begin
         dcsr_q           <= '0;
         dcsr_q.prv       <= riscv::PRIV_LVL_M;
@@ -2604,6 +2618,7 @@ module csr_regfile
         end
       end
     end else begin
+      c3_enable_q <= c3_enable_d;
       priv_lvl_q <= priv_lvl_d;
       // floating-point registers
       fcsr_q     <= fcsr_d;

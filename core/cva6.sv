@@ -606,6 +606,8 @@ module cva6
   amo_resp_t amo_resp;
   logic sb_full;
 
+
+  logic c3_enable;
   // ----------------
   // DCache <-> *
   // ----------------
@@ -1009,7 +1011,8 @@ module cva6
       .pmpaddr_i               (pmpaddr),
       //RVFI
       .rvfi_lsu_ctrl_o         (rvfi_lsu_ctrl),
-      .rvfi_mem_paddr_o        (rvfi_mem_paddr)
+      .rvfi_mem_paddr_o        (rvfi_mem_paddr),
+      .c3_enable_i             (c3_enable)
   );
 
   // ---------
@@ -1142,6 +1145,7 @@ module cva6
       .mcountinhibit_o         (mcountinhibit_csr_perf),
       //RVFI
       .rvfi_csr_o              (rvfi_csr),
+      .c3_enable_o              (c3_enable),
       .debug_req_i,
       .ipi_i,
       .irq_i,

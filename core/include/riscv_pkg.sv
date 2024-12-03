@@ -712,7 +712,8 @@ package riscv;
     CSR_HPM_COUNTER_28H  = 12'hC9C,  // reserved
     CSR_HPM_COUNTER_29H  = 12'hC9D,  // reserved
     CSR_HPM_COUNTER_30H  = 12'hC9E,  // reserved
-    CSR_HPM_COUNTER_31H  = 12'hC9F   // reserved
+    CSR_HPM_COUNTER_31H  = 12'hC9F,   // reserved
+    CSR_C3_ENABLE_0      = 12'hD00
   } csr_reg_t;
 
   localparam logic [63:0] SSTATUS_UIE = 'h00000001;
