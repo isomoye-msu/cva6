@@ -1,31 +1,473 @@
 `timescale 1ns/1ps
-import ex_stage_stub_pkg::*;   // Definitions for stub types used by the execute stage.
-import config_pkg::*;          
+import ex_stage_stub_pkg::*;  // Pulls in fu_data_t, plus operation codes
+import config_pkg::*;         // Pulls in cva6_cfg_t
+
 import riscv::*;               
 
-// Module: alu
-// Description:
-//   This module represents a simple ALU for the execute stage.
-//    It accepts function unit data and
-//   produces a result and a branch resolution signal (OPTIONAL).
-// Parameters:
-//   CVA6Cfg      - A structure containing configuration parameters for
-//                  the CVA6 processor (default is cva6_cfg_empty).
-//   HasBranch    - A flag indicating whether branch logic is implemented.
-//   fu_data_t    - The data type used for FU data (default is simple logic).
+module popcount #(
+  parameter int INPUT_WIDTH = 64
+)(
+  input  logic [INPUT_WIDTH-1:0] data_i,
+  output logic [$clog2(INPUT_WIDTH):0] popcount_o
+);
+  assign popcount_o = '0;
+endmodule
+
+module lzc #(
+  parameter int WIDTH = 64,
+  parameter int MODE  = 1
+)(
+  input  logic [WIDTH-1:0] in_i,
+  output logic [$clog2(WIDTH)-1:0] cnt_o,
+  output logic empty_o
+);
+  assign cnt_o   = '0;
+  assign empty_o = (in_i == '0);
+endmodule
+
 module alu #(
   parameter config_pkg::cva6_cfg_t CVA6Cfg = config_pkg::cva6_cfg_empty,
-  parameter bit HasBranch = 1'b0,
+  parameter bit HasBranch = 1'b1,
   parameter type fu_data_t = logic
 ) (
-  input  logic clk_i,                           // Clock input.
-  input  logic rst_ni,                          // Active-low reset input.
-  input  fu_data_t fu_data_i,                   // Function unit data input.
-  output logic [CVA6Cfg.XLEN-1:0] result_o,       // ALU result output.
-  output logic alu_branch_res_o                 // Branch resolution output.
+  input  logic clk_i,
+  input  logic rst_ni,
+  input  fu_data_t fu_data_i,
+  output logic [CVA6Cfg.XLEN-1:0] result_o,
+  output logic alu_branch_res_o
 );
-  assign result_o = '0;           // Result is statically 0.
-  assign alu_branch_res_o = 1'b0;  // Branch resolution signal is deasserted.
+
+  localparam bit L_IS_XLEN64  = (CVA6Cfg.XLEN == 64); 
+  localparam bit L_IS_XLEN32  = (CVA6Cfg.XLEN == 32); 
+  localparam bit L_RVB        = 1'b1;  
+  localparam bit L_ZKN        = 1'b0;  
+  localparam bit L_RVZiCond   = 1'b0;  
+  logic [CVA6Cfg.XLEN-1:0] operand_a_rev;
+  logic [31:0]             operand_a_rev32;
+  logic [CVA6Cfg.XLEN:0]   operand_b_neg;
+  logic [CVA6Cfg.XLEN+1:0] adder_result_ext_o;
+  logic                    less;  // handles both signed and unsigned comparisons
+  logic [31:0]             rolw;  // Rotate Left Word
+  logic [31:0]             rorw;  // Rotate Right Word
+  logic [31:0]             orcbw, rev8w;
+  logic [$clog2(CVA6Cfg.XLEN):0] cpop; // Count Population
+  logic [$clog2(CVA6Cfg.XLEN)-1:0] lz_tz_count;  // Count Leading Zeros
+  logic [4:0]              lz_tz_wcount;         // Count Leading Zeros Word
+  logic                    lz_tz_empty, lz_tz_wempty;
+  logic [CVA6Cfg.XLEN-1:0] orcbw_result, rev8w_result;
+  logic [CVA6Cfg.XLEN-1:0] brev8_reversed;
+  logic [31:0]             unzip_gen;
+  logic [31:0]             zip_gen;
+
+  // Adder signals
+  logic adder_op_b_negate;
+  logic adder_z_flag;
+  logic [CVA6Cfg.XLEN:0]   adder_in_a, adder_in_b;
+  logic [CVA6Cfg.XLEN-1:0] adder_result;
+  logic [CVA6Cfg.XLEN-1:0] operand_a_bitmanip, bit_indx;
+
+  // Shifts
+  logic shift_left;
+  logic shift_arithmetic;
+  logic [CVA6Cfg.XLEN-1:0] shift_amt;
+  logic [CVA6Cfg.XLEN-1:0] shift_op_a;
+  logic [31:0]             shift_op_a32;
+  logic [CVA6Cfg.XLEN-1:0] shift_result;
+  logic [31:0]             shift_result32;
+  logic [CVA6Cfg.XLEN:0]   shift_op_a_64, shift_right_result;
+  logic [32:0]             shift_op_a_32, shift_right_result32;
+  logic [CVA6Cfg.XLEN-1:0] shift_left_result;
+  logic [31:0]             shift_left_result32;
+
+  generate
+    genvar k;
+    for (k = 0; k < CVA6Cfg.XLEN; k++) begin
+      assign operand_a_rev[k] = fu_data_i.operand_a[CVA6Cfg.XLEN-1-k];
+    end
+    for (k = 0; k < 32; k++) begin
+      assign operand_a_rev32[k] = fu_data_i.operand_a[31-k];
+    end
+  endgenerate
+
+  assign adder_op_b_negate = fu_data_i.operation inside {
+    EQ, NE, SUB, SUBW, ANDN, ORN, XNOR
+  };
+
+  always_comb begin
+    $display($time, " ALU sees op=%0d, a=%h, b=%h => result=%h",
+            fu_data_i.operation, fu_data_i.operand_a, fu_data_i.operand_b, adder_result);
+    operand_a_bitmanip = fu_data_i.operand_a;
+
+    // Some bit manip instructions rewrite operand_a
+    //  only if L_RVB is enabled
+    if (L_RVB) begin
+      if (L_IS_XLEN64) begin
+        unique case (fu_data_i.operation)
+          SH1ADDUW:           operand_a_bitmanip = fu_data_i.operand_a[31:0] << 1;
+          SH2ADDUW:           operand_a_bitmanip = fu_data_i.operand_a[31:0] << 2;
+          SH3ADDUW:           operand_a_bitmanip = fu_data_i.operand_a[31:0] << 3;
+          CTZW:               operand_a_bitmanip = operand_a_rev32;
+          ADDUW, CPOPW, CLZW: operand_a_bitmanip = fu_data_i.operand_a[31:0];
+          default:            ;
+        endcase
+      end
+
+      unique case (fu_data_i.operation)
+        SH1ADD: operand_a_bitmanip = fu_data_i.operand_a << 1;
+        SH2ADD: operand_a_bitmanip = fu_data_i.operand_a << 2;
+        SH3ADD: operand_a_bitmanip = fu_data_i.operand_a << 3;
+        CTZ:    operand_a_bitmanip = operand_a_rev;
+        default: ;
+      endcase
+    end
+  end
+
+  // Prepare operand_a, operand_b for the adder
+  assign adder_in_a         = {operand_a_bitmanip, 1'b1};
+  assign operand_b_neg      = {fu_data_i.operand_b, 1'b0} ^ {CVA6Cfg.XLEN + 1{adder_op_b_negate}};
+  assign adder_in_b         = operand_b_neg;
+
+  // addition
+  assign adder_result_ext_o = adder_in_a + adder_in_b;
+  assign adder_result       = adder_result_ext_o[CVA6Cfg.XLEN:1];
+  assign adder_z_flag       = ~|adder_result;
+
+  if (HasBranch) begin
+    always_comb begin : branch_resolve
+      case (fu_data_i.operation)
+        EQ:       alu_branch_res_o = adder_z_flag;
+        NE:       alu_branch_res_o = ~adder_z_flag;
+        LTS, LTU: alu_branch_res_o = less;
+        GES, GEU: alu_branch_res_o = ~less;
+        default:  alu_branch_res_o = 1'b1;
+      endcase
+    end
+  end else begin
+    assign alu_branch_res_o = 1'b0;
+  end
+
+  assign shift_amt        = fu_data_i.operand_b;
+  assign shift_left       = (fu_data_i.operation == SLL) 
+                            | (L_IS_XLEN64 && fu_data_i.operation == SLLW);
+  assign shift_arithmetic = (fu_data_i.operation == SRA) 
+                            | (L_IS_XLEN64 && fu_data_i.operation == SRAW);
+
+  assign shift_op_a       = shift_left ? operand_a_rev : fu_data_i.operand_a;
+  assign shift_op_a32     = shift_left ? operand_a_rev32 : fu_data_i.operand_a[31:0];
+
+  assign shift_op_a_64    = {shift_arithmetic & shift_op_a[CVA6Cfg.XLEN-1], shift_op_a};
+  assign shift_op_a_32    = {shift_arithmetic & shift_op_a32[31], shift_op_a32};
+
+  assign shift_right_result   = $unsigned($signed(shift_op_a_64) >>> shift_amt[5:0]);
+  assign shift_right_result32 = $unsigned($signed(shift_op_a_32) >>> shift_amt[4:0]);
+
+  genvar j;
+  generate
+    for (j = 0; j < CVA6Cfg.XLEN; j++)
+      assign shift_left_result[j] = shift_right_result[CVA6Cfg.XLEN-1-j];
+
+    for (j = 0; j < 32; j++)
+      assign shift_left_result32[j] = shift_right_result32[31-j];
+  endgenerate
+
+  assign shift_result   = shift_left ? shift_left_result : shift_right_result[CVA6Cfg.XLEN-1:0];
+  assign shift_result32 = shift_left ? shift_left_result32 : shift_right_result32[31:0];
+
+  // Signed vs. unsigned compare
+  always_comb begin
+    logic sgn;
+    sgn = 1'b0;
+    if ((fu_data_i.operation == SLTS) ||
+        (fu_data_i.operation == LTS)  ||
+        (fu_data_i.operation == GES)  ||
+        (fu_data_i.operation == MAX)  ||
+        (fu_data_i.operation == MIN))
+      sgn = 1'b1;
+
+    less = ($signed({sgn & fu_data_i.operand_a[CVA6Cfg.XLEN-1], fu_data_i.operand_a}) <
+            $signed({sgn & fu_data_i.operand_b[CVA6Cfg.XLEN-1], fu_data_i.operand_b}));
+  end
+
+  // Only do if L_RVB is set, or you can always do it 
+  popcount #(.INPUT_WIDTH(CVA6Cfg.XLEN)) i_cpop_count (
+    .data_i    (operand_a_bitmanip),
+    .popcount_o(cpop)
+  );
+
+  // Leading zero count on full XLEN
+  lzc #(.WIDTH(CVA6Cfg.XLEN), .MODE(1)) i_clz_64b (
+    .in_i   (operand_a_bitmanip),
+    .cnt_o  (lz_tz_count),
+    .empty_o(lz_tz_empty)
+  );
+
+  generate
+    if (L_IS_XLEN64) begin : maybe_lzc_32
+      lzc #(.WIDTH(32), .MODE(1)) i_clz_32b (
+        .in_i   (operand_a_bitmanip[31:0]),
+        .cnt_o  (lz_tz_wcount),
+        .empty_o(lz_tz_wempty)
+      );
+    end
+  endgenerate
+
+  generate
+    if (L_RVB) begin : gen_orcbw_rev8w_results
+      always_comb begin
+        orcbw = {
+          {8{|fu_data_i.operand_a[31:24]}},
+          {8{|fu_data_i.operand_a[23:16]}},
+          {8{|fu_data_i.operand_a[15:8]}},
+          {8{|fu_data_i.operand_a[7:0]}}
+        };
+
+        rev8w = {
+          fu_data_i.operand_a[7:0],
+          fu_data_i.operand_a[15:8],
+          fu_data_i.operand_a[23:16],
+          fu_data_i.operand_a[31:24]
+        };
+      end
+
+      if (L_IS_XLEN64) begin : gen_64b
+        assign orcbw_result = {
+          {8{|fu_data_i.operand_a[63:56]}},
+          {8{|fu_data_i.operand_a[55:48]}},
+          {8{|fu_data_i.operand_a[47:40]}},
+          {8{|fu_data_i.operand_a[39:32]}},
+          orcbw
+        };
+        assign rev8w_result = {
+          rev8w,
+          fu_data_i.operand_a[39:32],
+          fu_data_i.operand_a[47:40],
+          fu_data_i.operand_a[55:48],
+          fu_data_i.operand_a[63:56]
+        };
+      end
+      else begin : gen_32b
+        assign orcbw_result = orcbw;
+        assign rev8w_result = rev8w;
+      end
+    end
+    else begin
+      // If L_RVB=0, tie them off
+      assign orcbw        = '0;
+      assign rev8w        = '0;
+      assign orcbw_result = '0;
+      assign rev8w_result = '0;
+    end
+  endgenerate
+
+  generate
+    if (L_ZKN && L_RVB) begin : zkn_gen_block
+      genvar i, m, n;
+      for (i = 0; i < (CVA6Cfg.XLEN / 8); i++) begin : brev8_gen
+        for (m = 0; m < 8; m++) begin : reverse_bits
+          assign brev8_reversed[(i<<3)+m] = fu_data_i.operand_a[(i<<3)+(7-m)];
+        end
+      end
+      if (L_IS_XLEN32) begin
+        for (n = 0; n < 16; n++) begin : zip_unzip_gen
+          assign zip_gen[n<<1]     = fu_data_i.operand_a[n];
+          assign zip_gen[(n<<1)+1] = fu_data_i.operand_a[n+16];
+          assign unzip_gen[n]      = fu_data_i.operand_a[n<<1];
+          assign unzip_gen[n+16]   = fu_data_i.operand_a[(n<<1)+1];
+        end
+      end
+    end
+    else begin
+      assign brev8_reversed = '0;
+      assign zip_gen        = '0;
+      assign unzip_gen      = '0;
+    end
+  endgenerate
+
+  always_comb begin
+    result_o = '0;
+
+    // 64-bit sign extension for W instructions
+    if (L_IS_XLEN64) begin
+      unique case (fu_data_i.operation)
+        // Add word => sign-extend 32 bits
+        ADDW, SUBW:
+          result_o = {{(CVA6Cfg.XLEN - 32){adder_result[31]}}, adder_result[31:0]};
+        SH1ADDUW, SH2ADDUW, SH3ADDUW:
+          result_o = adder_result;
+        SLLW, SRLW, SRAW:
+          result_o = {{(CVA6Cfg.XLEN - 32){shift_result32[31]}}, shift_result32[31:0]};
+        default: ;
+      endcase
+    end
+
+    unique case (fu_data_i.operation)
+      // Bitwise
+      ANDL, ANDN:
+        result_o = fu_data_i.operand_a & operand_b_neg[CVA6Cfg.XLEN:1];
+      ORL, ORN:
+        result_o = fu_data_i.operand_a | operand_b_neg[CVA6Cfg.XLEN:1];
+      XORL, XNOR:
+        result_o = fu_data_i.operand_a ^ operand_b_neg[CVA6Cfg.XLEN:1];
+
+      // Add/sub
+      ADD, SUB, ADDUW, SH1ADD, SH2ADD, SH3ADD:
+        result_o = adder_result;
+
+      // Shift
+      SLL, SRL, SRA:
+        if (L_IS_XLEN64) result_o = shift_result;
+        else             result_o = shift_result32;
+
+      // Compare
+      SLTS, SLTU:
+        result_o = {{(CVA6Cfg.XLEN - 1){1'b0}}, less};
+
+      default: ;
+    endcase
+
+    // Additional RVB-based rotates, min/max, etc.
+    if (L_RVB) begin
+      bit_indx = 1 << (fu_data_i.operand_b & (CVA6Cfg.XLEN - 1));
+      if (L_IS_XLEN64) begin
+        // 32-bit rotates
+        rolw = ({{(CVA6Cfg.XLEN-32){1'b0}}, fu_data_i.operand_a[31:0]} << fu_data_i.operand_b[4:0])
+             | ({{(CVA6Cfg.XLEN-32){1'b0}}, fu_data_i.operand_a[31:0]} >> (CVA6Cfg.XLEN-32 - fu_data_i.operand_b[4:0]));
+        rorw = ({{(CVA6Cfg.XLEN-32){1'b0}}, fu_data_i.operand_a[31:0]} >> fu_data_i.operand_b[4:0])
+             | ({{(CVA6Cfg.XLEN-32){1'b0}}, fu_data_i.operand_a[31:0]} << (CVA6Cfg.XLEN-32 - fu_data_i.operand_b[4:0]));
+
+        unique case (fu_data_i.operation)
+          CLZW, CTZW:
+            result_o = (lz_tz_wempty) ? 32
+                      : {{(CVA6Cfg.XLEN - 5){1'b0}}, lz_tz_wcount};
+          ROLW:
+            result_o = {{(CVA6Cfg.XLEN - 32){rolw[31]}}, rolw};
+          RORW, RORIW:
+            result_o = {{(CVA6Cfg.XLEN - 32){rorw[31]}}, rorw};
+          default: ;
+        endcase
+      end
+
+      unique case (fu_data_i.operation)
+        // Min/Max
+        MAX:  result_o = less ? fu_data_i.operand_b : fu_data_i.operand_a;
+        MAXU: result_o = less ? fu_data_i.operand_b : fu_data_i.operand_a;
+        MIN:  result_o = ~less ? fu_data_i.operand_b : fu_data_i.operand_a;
+        MINU: result_o = ~less ? fu_data_i.operand_b : fu_data_i.operand_a;
+
+        // Single-bit instructions
+        BCLR, BCLRI:
+          result_o = fu_data_i.operand_a & ~bit_indx;
+        BEXT, BEXTI:
+          result_o = {{(CVA6Cfg.XLEN-1){1'b0}}, |(fu_data_i.operand_a & bit_indx)};
+        BINV, BINVI:
+          result_o = fu_data_i.operand_a ^ bit_indx;
+        BSET, BSETI:
+          result_o = fu_data_i.operand_a | bit_indx;
+
+        // Leading/Trailing zeros
+        CLZ, CTZ:
+          result_o = (lz_tz_empty)
+            ? ({{(CVA6Cfg.XLEN - $clog2(CVA6Cfg.XLEN)){1'b0}}, lz_tz_count} + 1)
+            : {{(CVA6Cfg.XLEN - $clog2(CVA6Cfg.XLEN)){1'b0}}, lz_tz_count};
+
+        // Popcount
+        CPOP, CPOPW:
+          result_o = {{(CVA6Cfg.XLEN - ($clog2(CVA6Cfg.XLEN)+1)){1'b0}}, cpop};
+
+        // Sign & zero extend
+        SEXTB:
+          result_o = {{(CVA6Cfg.XLEN-8){fu_data_i.operand_a[7]}}, fu_data_i.operand_a[7:0]};
+        SEXTH:
+          result_o = {{(CVA6Cfg.XLEN-16){fu_data_i.operand_a[15]}}, fu_data_i.operand_a[15:0]};
+        ZEXTH:
+          result_o = {{(CVA6Cfg.XLEN-16){1'b0}}, fu_data_i.operand_a[15:0]};
+
+        // Bitwise Rotation
+        ROL:
+          if (L_IS_XLEN64) begin
+            result_o = (fu_data_i.operand_a << fu_data_i.operand_b[5:0])
+                     | (fu_data_i.operand_a >> (CVA6Cfg.XLEN - fu_data_i.operand_b[5:0]));
+          end
+          else begin
+            result_o = (fu_data_i.operand_a << fu_data_i.operand_b[4:0])
+                     | (fu_data_i.operand_a >> (CVA6Cfg.XLEN - fu_data_i.operand_b[4:0]));
+          end
+
+        ROR, RORI:
+          if (L_IS_XLEN64) begin
+            result_o = (fu_data_i.operand_a >> fu_data_i.operand_b[5:0])
+                     | (fu_data_i.operand_a << (CVA6Cfg.XLEN - fu_data_i.operand_b[5:0]));
+          end
+          else begin
+            result_o = (fu_data_i.operand_a >> fu_data_i.operand_b[4:0])
+                     | (fu_data_i.operand_a << (CVA6Cfg.XLEN - fu_data_i.operand_b[4:0]));
+          end
+
+        ORCB: if (L_RVB) result_o = orcbw_result;
+        REV8: if (L_RVB) result_o = rev8w_result;
+
+        // 32-bit left shift
+        default:
+          if (fu_data_i.operation == SLLIUW && L_IS_XLEN64) begin
+            result_o = {{(CVA6Cfg.XLEN-32){1'b0}}, fu_data_i.operand_a[31:0]}
+                       << fu_data_i.operand_b[5:0];
+          end
+      endcase
+    end 
+
+    if (L_RVZiCond) begin
+      unique case (fu_data_i.operation)
+        CZERO_EQZ:
+          result_o = (|fu_data_i.operand_b) ? fu_data_i.operand_a : '0;
+        CZERO_NEZ:
+          result_o = (|fu_data_i.operand_b) ? '0 : fu_data_i.operand_a;
+        default: ;
+      endcase
+    end
+
+    // ZKN instructions
+    if (L_ZKN && L_RVB) begin
+      unique case (fu_data_i.operation)
+        PACK:
+          if (L_IS_XLEN32) begin
+            result_o = {fu_data_i.operand_b[15:0], fu_data_i.operand_a[15:0]};
+          end
+          else begin
+            result_o = {fu_data_i.operand_b[31:0], fu_data_i.operand_a[31:0]};
+          end
+
+        PACK_H:
+          if (L_IS_XLEN32) begin
+            result_o = {16'b0, fu_data_i.operand_b[7:0], fu_data_i.operand_a[7:0]};
+          end
+          else begin
+            result_o = {48'b0, fu_data_i.operand_b[7:0], fu_data_i.operand_a[7:0]};
+          end
+
+        BREV8:
+          result_o = brev8_reversed;
+
+        default: ;
+      endcase
+
+      if (fu_data_i.operation == PACK_W && L_IS_XLEN64) begin
+        result_o = {
+          {32{fu_data_i.operand_b[15]}},
+          fu_data_i.operand_b[15:0],
+          fu_data_i.operand_a[15:0]
+        };
+      end
+
+      if (fu_data_i.operation == UNZIP && L_IS_XLEN32) begin
+        result_o = unzip_gen;
+      end
+
+      if (fu_data_i.operation == ZIP && L_IS_XLEN32) begin
+        result_o = zip_gen;
+      end
+    end // if (L_ZKN && L_RVB)
+  end 
+
 endmodule
 
 // Module: branch_unit
