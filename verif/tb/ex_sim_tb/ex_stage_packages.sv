@@ -106,7 +106,7 @@ package ex_stage_stub_pkg;
   // Function unit data structure.
   typedef struct packed {
     logic [31:0] trans_id;   // Transaction identifier
-    logic [4:0]  operation;  // Operation code (e.g., ADD, SUB)
+    logic [6:0]  operation;  // Operation code (e.g., ADD, SUB)
     logic [63:0] operand_a;  // First operand
     logic [63:0] operand_b;  // Second operand
     logic [63:0] imm;        // Immediate value
