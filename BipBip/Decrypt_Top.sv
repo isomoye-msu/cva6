@@ -3,7 +3,6 @@
 // Register the incoming ciphertext and the done-pulse before feeding the
 // BipBip_Cipher decryption tree.
 //-----------------------------------------------------------------------------
-`timescale 1ns/1ps
 import BipBip_pkg::*;
 
 module Decrypt_Top (
