@@ -6,7 +6,6 @@
 //      -> BipBip_Encrypt     : forward data path
 //      ->  BipBip_Decrypt     : inverse data path
 //-----------------------------------------------------------------------------
-`timescale 1ns/1ps
 import BipBip_pkg::*;
 
 module BipBip_Cipher (
