@@ -14,7 +14,6 @@
 //      KAD(drk[10]) → RFS
 //      KAD(drk[11]) (final XOR)
 //-----------------------------------------------------------------------------
-`timescale 1ns/1ps
 import BipBip_pkg::*;
 
 module BipBip_Decrypt (
